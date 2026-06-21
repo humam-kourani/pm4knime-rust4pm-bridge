@@ -24,6 +24,8 @@ const TABLE_EVENT_TYPES: &str = "event_types";
 const TABLE_OBJECT_TYPES: &str = "object_types";
 const TABLE_EVENTS: &str = "events";
 const TABLE_OBJECTS: &str = "objects";
+const TABLE_E2O: &str = "e2o";
+const TABLE_O2O: &str = "o2o";
 const TABLE_EVENT: &str = TABLE_EVENTS;
 const TABLE_OBJECT: &str = TABLE_OBJECTS;
 const TABLE_EVENT_OBJECT: &str = "event_object";
@@ -37,6 +39,10 @@ const COL_TYPE: &str = "type";
 const COL_TIME: &str = "time";
 const COL_ATTRIBUTES: &str = "attributes";
 const COL_RELATIONSHIPS: &str = "relationships";
+const COL_EVENT_ID: &str = "event_id";
+const COL_OBJECT_ID: &str = "object_id";
+const COL_RELATED_OBJECT_ID: &str = "related_object_id";
+const COL_QUALIFIER: &str = "qualifier";
 const COL_OCEL_ID: &str = COL_ID;
 const COL_OCEL_TYPE: &str = COL_TYPE;
 const COL_OCEL_TIME: &str = COL_TIME;
@@ -117,6 +123,7 @@ struct RowsPayload {
 struct QueryRequest {
     operation: Option<String>,
     table: String,
+    columns: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -332,8 +339,8 @@ fn operation_catalog_json() -> Result<Vec<u8>, String> {
             },
             OperationDefinition {
                 name: "ocel.query.table",
-                description: "Return one native OCEL top-level collection as an Arrow IPC stream.",
-                input: "{handle, table}",
+                description: "Return one native OCEL collection or relation projection as an Arrow IPC stream.",
+                input: "{handle, table, columns?}",
                 output: "Arrow IPC stream bytes",
             },
         ],
@@ -351,7 +358,7 @@ fn query_arrow_ipc(native: &NativeOcel, query_json: &str) -> Result<Vec<u8>, Str
             ));
         }
     }
-    table_arrow_ipc(native, &request.table)
+    table_arrow_ipc(native, &request.table, request.columns.as_deref())
 }
 
 fn table_rows_json(
@@ -600,124 +607,322 @@ fn logical_type(declared_type: &str) -> String {
     .to_string()
 }
 
-fn table_arrow_ipc(native: &NativeOcel, table_name: &str) -> Result<Vec<u8>, String> {
+fn table_arrow_ipc(
+    native: &NativeOcel,
+    table_name: &str,
+    requested_columns: Option<&[String]>,
+) -> Result<Vec<u8>, String> {
+    if is_e2o_table(table_name) {
+        let columns = projected_static_columns(
+            TABLE_E2O,
+            requested_columns,
+            &[COL_EVENT_ID, COL_OBJECT_ID, COL_QUALIFIER],
+        )?;
+        return arrow_for_event_object_relations(native, &columns);
+    }
+    if is_o2o_table(table_name) {
+        let columns = projected_static_columns(
+            TABLE_O2O,
+            requested_columns,
+            &[COL_OBJECT_ID, COL_RELATED_OBJECT_ID, COL_QUALIFIER],
+        )?;
+        return arrow_for_object_object_relations(native, &columns);
+    }
+    let table = native
+        .metadata
+        .tables
+        .iter()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| {
+            format!(
+                "Native OCEL table '{table_name}' is not available. Available native query tables: {}, {}, {}, {}, {}, {}.",
+                TABLE_EVENT_TYPES, TABLE_OBJECT_TYPES, TABLE_EVENTS, TABLE_OBJECTS, TABLE_E2O, TABLE_O2O
+            )
+        })?;
+    let columns = projected_columns(table, requested_columns)?;
     match table_name {
-        TABLE_EVENT_TYPES => arrow_for_type_definitions(&native.metadata.event_types),
-        TABLE_OBJECT_TYPES => arrow_for_type_definitions(&native.metadata.object_types),
-        TABLE_EVENTS => arrow_for_events(native),
-        TABLE_OBJECTS => arrow_for_objects(native),
+        TABLE_EVENT_TYPES => arrow_for_type_definitions(&native.metadata.event_types, &columns),
+        TABLE_OBJECT_TYPES => arrow_for_type_definitions(&native.metadata.object_types, &columns),
+        TABLE_EVENTS => arrow_for_events(native, &columns),
+        TABLE_OBJECTS => arrow_for_objects(native, &columns),
         _ => Err(format!(
-            "Native OCEL table '{table_name}' is not available. Available native collections: {}, {}, {}, {}.",
-            TABLE_EVENT_TYPES, TABLE_OBJECT_TYPES, TABLE_EVENTS, TABLE_OBJECTS
+            "Native OCEL table '{table_name}' is not available. Available native query tables: {}, {}, {}, {}, {}, {}.",
+            TABLE_EVENT_TYPES, TABLE_OBJECT_TYPES, TABLE_EVENTS, TABLE_OBJECTS, TABLE_E2O, TABLE_O2O
         )),
     }
 }
 
-fn arrow_for_type_definitions(definitions: &[TypeDefinition]) -> Result<Vec<u8>, String> {
-    let names = definitions
-        .iter()
-        .map(|definition| definition.name.clone())
-        .collect::<Vec<_>>();
-    let attributes = definitions
-        .iter()
-        .map(|definition| json_string(&definition.attributes))
-        .collect::<Result<Vec<_>, _>>()?;
-    write_arrow_ipc(
-        vec![COL_NAME, COL_ATTRIBUTES],
-        vec![string_array(names), string_array(attributes)],
+fn is_e2o_table(table_name: &str) -> bool {
+    matches!(
+        table_name,
+        TABLE_E2O | TABLE_EVENT_OBJECT | "event_objects" | "event-object" | "event-objects"
     )
 }
 
-fn arrow_for_events(native: &NativeOcel) -> Result<Vec<u8>, String> {
-    let ids = native
-        .ocel
-        .events
-        .iter()
-        .map(|event| event.id.clone())
-        .collect::<Vec<_>>();
-    let types = native
-        .ocel
-        .events
-        .iter()
-        .map(|event| event.event_type.clone())
-        .collect::<Vec<_>>();
-    let times = native
-        .ocel
-        .events
-        .iter()
-        .map(|event| event.time.to_rfc3339())
-        .collect::<Vec<_>>();
-    let attributes = native
-        .ocel
-        .events
-        .iter()
-        .map(|event| json_string(&event.attributes))
-        .collect::<Result<Vec<_>, _>>()?;
-    let relationships = native
-        .ocel
-        .events
-        .iter()
-        .map(|event| json_string(&event.relationships))
-        .collect::<Result<Vec<_>, _>>()?;
-    write_arrow_ipc(
-        vec![
-            COL_ID,
-            COL_TYPE,
-            COL_TIME,
-            COL_ATTRIBUTES,
-            COL_RELATIONSHIPS,
-        ],
-        vec![
-            string_array(ids),
-            string_array(types),
-            string_array(times),
-            string_array(attributes),
-            string_array(relationships),
-        ],
+fn is_o2o_table(table_name: &str) -> bool {
+    matches!(
+        table_name,
+        TABLE_O2O | TABLE_OBJECT_OBJECT | "object_objects" | "object-object" | "object-objects"
     )
 }
 
-fn arrow_for_objects(native: &NativeOcel) -> Result<Vec<u8>, String> {
-    let ids = native
+fn projected_columns(
+    table: &TableDefinition,
+    requested_columns: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    match requested_columns {
+        Some(columns) if !columns.is_empty() => {
+            let available = table
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<HashSet<_>>();
+            for column in columns {
+                if !available.contains(column.as_str()) {
+                    return Err(format!(
+                        "Native OCEL table '{}' has no column '{}'. Available columns: {}.",
+                        table.name,
+                        column,
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| column.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            Ok(columns.to_vec())
+        }
+        _ => Ok(table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()),
+    }
+}
+
+fn projected_static_columns(
+    table_name: &str,
+    requested_columns: Option<&[String]>,
+    available_columns: &[&str],
+) -> Result<Vec<String>, String> {
+    match requested_columns {
+        Some(columns) if !columns.is_empty() => {
+            let available = available_columns.iter().copied().collect::<HashSet<_>>();
+            for column in columns {
+                if !available.contains(column.as_str()) {
+                    return Err(format!(
+                        "Native OCEL table '{table_name}' has no column '{column}'. Available columns: {}.",
+                        available_columns.join(", ")
+                    ));
+                }
+            }
+            Ok(columns.to_vec())
+        }
+        _ => Ok(available_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect()),
+    }
+}
+
+fn arrow_for_type_definitions(
+    definitions: &[TypeDefinition],
+    columns: &[String],
+) -> Result<Vec<u8>, String> {
+    let mut arrays = Vec::new();
+    for column in columns {
+        match column.as_str() {
+            COL_NAME => arrays.push(string_array(
+                definitions
+                    .iter()
+                    .map(|definition| definition.name.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            COL_ATTRIBUTES => arrays.push(string_array(
+                definitions
+                    .iter()
+                    .map(|definition| json_string(&definition.attributes))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            _ => return Err(format!("Unsupported OCEL type column '{column}'.")),
+        }
+    }
+    write_arrow_ipc(columns.to_vec(), arrays)
+}
+
+fn arrow_for_events(native: &NativeOcel, columns: &[String]) -> Result<Vec<u8>, String> {
+    let mut arrays = Vec::new();
+    for column in columns {
+        match column.as_str() {
+            COL_ID => arrays.push(string_array(
+                native
+                    .ocel
+                    .events
+                    .iter()
+                    .map(|event| event.id.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            COL_TYPE => arrays.push(string_array(
+                native
+                    .ocel
+                    .events
+                    .iter()
+                    .map(|event| event.event_type.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            COL_TIME => arrays.push(string_array(
+                native
+                    .ocel
+                    .events
+                    .iter()
+                    .map(|event| event.time.to_rfc3339())
+                    .collect::<Vec<_>>(),
+            )),
+            COL_ATTRIBUTES => arrays.push(string_array(
+                native
+                    .ocel
+                    .events
+                    .iter()
+                    .map(|event| json_string(&event.attributes))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            COL_RELATIONSHIPS => arrays.push(string_array(
+                native
+                    .ocel
+                    .events
+                    .iter()
+                    .map(|event| json_string(&event.relationships))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            _ => return Err(format!("Unsupported OCEL events column '{column}'.")),
+        }
+    }
+    write_arrow_ipc(columns.to_vec(), arrays)
+}
+
+fn arrow_for_objects(native: &NativeOcel, columns: &[String]) -> Result<Vec<u8>, String> {
+    let mut arrays = Vec::new();
+    for column in columns {
+        match column.as_str() {
+            COL_ID => arrays.push(string_array(
+                native
+                    .ocel
+                    .objects
+                    .iter()
+                    .map(|object| object.id.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            COL_TYPE => arrays.push(string_array(
+                native
+                    .ocel
+                    .objects
+                    .iter()
+                    .map(|object| object.object_type.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            COL_ATTRIBUTES => arrays.push(string_array(
+                native
+                    .ocel
+                    .objects
+                    .iter()
+                    .map(|object| json_string(&object.attributes))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            COL_RELATIONSHIPS => arrays.push(string_array(
+                native
+                    .ocel
+                    .objects
+                    .iter()
+                    .map(|object| json_string(&object.relationships))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            _ => return Err(format!("Unsupported OCEL objects column '{column}'.")),
+        }
+    }
+    write_arrow_ipc(columns.to_vec(), arrays)
+}
+
+fn arrow_for_event_object_relations(
+    native: &NativeOcel,
+    columns: &[String],
+) -> Result<Vec<u8>, String> {
+    let row_count = native
+        .ocel
+        .events
+        .iter()
+        .map(|event| event.relationships.len())
+        .sum();
+    let mut event_ids = Vec::with_capacity(row_count);
+    let mut object_ids = Vec::with_capacity(row_count);
+    let mut qualifiers = Vec::with_capacity(row_count);
+    for event in &native.ocel.events {
+        for relationship in &event.relationships {
+            event_ids.push(event.id.clone());
+            object_ids.push(relationship.object_id.clone());
+            qualifiers.push(relationship.qualifier.clone());
+        }
+    }
+
+    let mut arrays = Vec::new();
+    for column in columns {
+        match column.as_str() {
+            COL_EVENT_ID => arrays.push(string_array(event_ids.clone())),
+            COL_OBJECT_ID => arrays.push(string_array(object_ids.clone())),
+            COL_QUALIFIER => arrays.push(string_array(qualifiers.clone())),
+            _ => {
+                return Err(format!(
+                    "Unsupported OCEL event-object relation column '{column}'."
+                ))
+            }
+        }
+    }
+    write_arrow_ipc(columns.to_vec(), arrays)
+}
+
+fn arrow_for_object_object_relations(
+    native: &NativeOcel,
+    columns: &[String],
+) -> Result<Vec<u8>, String> {
+    let row_count = native
         .ocel
         .objects
         .iter()
-        .map(|object| object.id.clone())
-        .collect::<Vec<_>>();
-    let types = native
-        .ocel
-        .objects
-        .iter()
-        .map(|object| object.object_type.clone())
-        .collect::<Vec<_>>();
-    let attributes = native
-        .ocel
-        .objects
-        .iter()
-        .map(|object| json_string(&object.attributes))
-        .collect::<Result<Vec<_>, _>>()?;
-    let relationships = native
-        .ocel
-        .objects
-        .iter()
-        .map(|object| json_string(&object.relationships))
-        .collect::<Result<Vec<_>, _>>()?;
-    write_arrow_ipc(
-        vec![COL_ID, COL_TYPE, COL_ATTRIBUTES, COL_RELATIONSHIPS],
-        vec![
-            string_array(ids),
-            string_array(types),
-            string_array(attributes),
-            string_array(relationships),
-        ],
-    )
+        .map(|object| object.relationships.len())
+        .sum();
+    let mut object_ids = Vec::with_capacity(row_count);
+    let mut related_object_ids = Vec::with_capacity(row_count);
+    let mut qualifiers = Vec::with_capacity(row_count);
+    for object in &native.ocel.objects {
+        for relationship in &object.relationships {
+            object_ids.push(object.id.clone());
+            related_object_ids.push(relationship.object_id.clone());
+            qualifiers.push(relationship.qualifier.clone());
+        }
+    }
+
+    let mut arrays = Vec::new();
+    for column in columns {
+        match column.as_str() {
+            COL_OBJECT_ID => arrays.push(string_array(object_ids.clone())),
+            COL_RELATED_OBJECT_ID => arrays.push(string_array(related_object_ids.clone())),
+            COL_QUALIFIER => arrays.push(string_array(qualifiers.clone())),
+            _ => {
+                return Err(format!(
+                    "Unsupported OCEL object-object relation column '{column}'."
+                ))
+            }
+        }
+    }
+    write_arrow_ipc(columns.to_vec(), arrays)
 }
 
 fn string_array(values: Vec<String>) -> ArrayRef {
     Arc::new(StringArray::from(values))
 }
 
-fn write_arrow_ipc(column_names: Vec<&str>, arrays: Vec<ArrayRef>) -> Result<Vec<u8>, String> {
+fn write_arrow_ipc(column_names: Vec<String>, arrays: Vec<ArrayRef>) -> Result<Vec<u8>, String> {
     let fields = column_names
         .into_iter()
         .map(|name| Field::new(name, DataType::Utf8, false))
