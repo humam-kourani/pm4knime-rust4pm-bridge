@@ -1,0 +1,191 @@
+name: Build native OCEL libraries
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_binaries:
+        description: "Commit generated native OCEL libraries back into org.pm4knime.java/os"
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches:
+      - dev
+      - nightly
+      - main
+      - master
+    paths:
+      - "org.pm4knime.native.ocel/**"
+      - ".github/workflows/build-native-ocel-all.yml"
+  pull_request:
+    paths:
+      - "org.pm4knime.native.ocel/**"
+      - ".github/workflows/build-native-ocel-all.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.id }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: win32-x86_64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            bundle_dir: org.pm4knime.java/os/win32/x86_64
+            lib_name: pm4knime_ocel_native.dll
+            artifact_name: pm4knime-ocel-native-win32-x86_64
+
+          - id: linux-x86_64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            bundle_dir: org.pm4knime.java/os/linux/x86_64
+            lib_name: libpm4knime_ocel_native.so
+            artifact_name: pm4knime-ocel-native-linux-x86_64
+
+          - id: macosx-x86_64
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            bundle_dir: org.pm4knime.java/os/macosx/x86_64
+            lib_name: libpm4knime_ocel_native.dylib
+            artifact_name: pm4knime-ocel-native-macosx-x86_64
+
+          - id: macosx-aarch64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+            bundle_dir: org.pm4knime.java/os/macosx/aarch64
+            lib_name: libpm4knime_ocel_native.dylib
+            artifact_name: pm4knime-ocel-native-macosx-aarch64
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "10"
+      # Rayon 1.12+ requires rustc 1.80 or newer. Use stable to avoid MSRV failures.
+      RUST_TOOLCHAIN: "stable"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev pkg-config
+
+      - name: Install Windows SQLite dependency for Rust build
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if ([string]::IsNullOrWhiteSpace($vcpkgRoot)) {
+            $vcpkgRoot = "C:\\vcpkg"
+          }
+
+          & "$vcpkgRoot\vcpkg.exe" install sqlite3:x64-windows-static-md
+
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_DEFAULT_TRIPLET=x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add "${{ matrix.rust_target }}" --toolchain "$RUST_TOOLCHAIN"
+          rustc +"$RUST_TOOLCHAIN" --version
+          cargo +"$RUST_TOOLCHAIN" --version
+
+      - name: Build native library
+        shell: bash
+        run: |
+          cargo +"$RUST_TOOLCHAIN" build \
+            --manifest-path org.pm4knime.native.ocel/Cargo.toml \
+            --release \
+            --target "${{ matrix.rust_target }}"
+
+      - name: Copy library into plugin bundle path
+        shell: bash
+        run: |
+          source_path="org.pm4knime.native.ocel/target/${{ matrix.rust_target }}/release/${{ matrix.lib_name }}"
+          target_path="${{ matrix.bundle_dir }}/${{ matrix.lib_name }}"
+
+          test -f "$source_path"
+          mkdir -p "${{ matrix.bundle_dir }}"
+          cp -f "$source_path" "$target_path"
+          ls -la "${{ matrix.bundle_dir }}"
+
+      - name: Upload native library artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.bundle_dir }}/${{ matrix.lib_name }}
+          if-no-files-found: error
+          retention-days: 14
+
+  commit-binaries:
+    name: Commit generated binaries
+    needs: build-native
+    # Commit automatically on push builds. For manual runs, use the commit_binaries input.
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.commit_binaries) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Download all native library artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .native-ocel-artifacts
+
+      - name: Copy artifacts into bundle paths
+        shell: bash
+        run: |
+          mkdir -p org.pm4knime.java/os/win32/x86_64
+          mkdir -p org.pm4knime.java/os/linux/x86_64
+          mkdir -p org.pm4knime.java/os/macosx/x86_64
+          mkdir -p org.pm4knime.java/os/macosx/aarch64
+
+          cp -f .native-ocel-artifacts/pm4knime-ocel-native-win32-x86_64/pm4knime_ocel_native.dll \
+            org.pm4knime.java/os/win32/x86_64/pm4knime_ocel_native.dll
+
+          cp -f .native-ocel-artifacts/pm4knime-ocel-native-linux-x86_64/libpm4knime_ocel_native.so \
+            org.pm4knime.java/os/linux/x86_64/libpm4knime_ocel_native.so
+
+          cp -f .native-ocel-artifacts/pm4knime-ocel-native-macosx-x86_64/libpm4knime_ocel_native.dylib \
+            org.pm4knime.java/os/macosx/x86_64/libpm4knime_ocel_native.dylib
+
+          cp -f .native-ocel-artifacts/pm4knime-ocel-native-macosx-aarch64/libpm4knime_ocel_native.dylib \
+            org.pm4knime.java/os/macosx/aarch64/libpm4knime_ocel_native.dylib
+
+          git status --short -- org.pm4knime.java/os
+
+      - name: Commit binaries back to this branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -z "$(git status --porcelain -- org.pm4knime.java/os)" ]; then
+            echo "No native binary changes to commit."
+            exit 0
+          fi
+
+          git add \
+            org.pm4knime.java/os/win32/x86_64/pm4knime_ocel_native.dll \
+            org.pm4knime.java/os/linux/x86_64/libpm4knime_ocel_native.so \
+            org.pm4knime.java/os/macosx/x86_64/libpm4knime_ocel_native.dylib \
+            org.pm4knime.java/os/macosx/aarch64/libpm4knime_ocel_native.dylib
+
+          git commit -m "Build OCEL native libraries"
+          git push origin HEAD:${{ github.ref_name }}
